@@ -1,3 +1,4 @@
+#!coding: utf-8
 from torch.utils.data import Dataset
 import torch
 import os
@@ -29,6 +30,7 @@ def post_processing_chat(prompt_content, empty_think_ratio=0.05):
     return prompt_content
 
 class PretrainDataset(Dataset):
+    # 预训练数据类
     def __init__(self, data_path, tokenizer, max_length=512):
         super().__init__()
         self.tokenizer = tokenizer
@@ -41,10 +43,13 @@ class PretrainDataset(Dataset):
     def __getitem__(self, index):
         sample = self.samples[index]
         tokens = self.tokenizer(str(sample['text']), add_special_tokens=False, max_length=self.max_length - 2, truncation=True).input_ids
+        # 拿到的数据: sample['text']都是纯文本, 前后加上bos_token_id和eos_token_id
         tokens = [self.tokenizer.bos_token_id] + tokens + [self.tokenizer.eos_token_id]
+        # 进行 right padding: 确保输出的inputs_ids的长度都是self.max_length长
         input_ids = tokens + [self.tokenizer.pad_token_id] * (self.max_length - len(tokens))
         input_ids = torch.tensor(input_ids, dtype=torch.long)
         labels = input_ids.clone()
+        # padding部分进行特殊标记(-100), 计算CE loss时会自动忽略
         labels[input_ids == self.tokenizer.pad_token_id] = -100
         return input_ids, labels
 
@@ -55,6 +60,7 @@ class SFTDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.samples = load_dataset('json', data_files=jsonl_path, split='train')
+        # 这里的self.bos_id主要是代表QA数据集中的回答部分的开始和结束
         self.bos_id = tokenizer(f'{tokenizer.bos_token}assistant\n', add_special_tokens=False).input_ids
         self.eos_id = tokenizer(f'{tokenizer.eos_token}\n', add_special_tokens=False).input_ids
 
@@ -72,17 +78,21 @@ class SFTDataset(Dataset):
         )
 
     def generate_labels(self, input_ids):
+        # 默认是-100, 即不参与loss计算
         labels = [-100] * len(input_ids)
         i = 0
         while i < len(input_ids):
+            # 寻找QA对中回复的开始位置
             if input_ids[i:i + len(self.bos_id)] == self.bos_id:
                 start = i + len(self.bos_id)
                 end = start
                 while end < len(input_ids):
+                    # 寻找QA对中回复的结束位置
                     if input_ids[end:end + len(self.eos_id)] == self.eos_id:
                         break
                     end += 1
                 for j in range(start, min(end + len(self.eos_id), self.max_length)):
+                    # 实际是从start->end 代表，回复的部分(包括了self.eos_id部分)参与loss计算
                     labels[j] = input_ids[j]
                 i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
             else:
@@ -94,7 +104,9 @@ class SFTDataset(Dataset):
         conversations = pre_processing_chat(sample['conversations'])
         prompt = self.create_chat_prompt(conversations)
         prompt = post_processing_chat(prompt)
+        # prompt中有bos_token和eos_token, 不用像PretrainDataset那样自行添加
         input_ids = self.tokenizer(prompt).input_ids[:self.max_length]
+        # 输入的 input_ids 也是进行right padding: 来满足统一的self.max_length 长度输入
         input_ids += [self.tokenizer.pad_token_id] * (self.max_length - len(input_ids))
         labels = self.generate_labels(input_ids)
         # # === 调试打印 ===
