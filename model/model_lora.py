@@ -21,12 +21,14 @@ class LoRA(nn.Module):
 def apply_lora(model, rank=8):
     for name, module in model.named_modules():
         if isinstance(module, nn.Linear) and module.weight.shape[0] == module.weight.shape[1]:
+            # 这里是对所有线性层 and 输入和输出维度的一致的起效
             lora = LoRA(module.weight.shape[0], module.weight.shape[1], rank=rank).to(model.device)
             setattr(module, "lora", lora)
             original_forward = module.forward
 
             # 显式绑定
             def forward_with_lora(x, layer1=original_forward, layer2=lora):
+                # 原始forward和lora通道的forward加到一起来输出
                 return layer1(x) + layer2(x)
 
             module.forward = forward_with_lora
@@ -38,6 +40,7 @@ def load_lora(model, path):
 
     for name, module in model.named_modules():
         if hasattr(module, 'lora'):
+            # 按照save_lora中的命名规则来加载lora部分的权重
             lora_state = {k.replace(f'{name}.lora.', ''): v for k, v in state_dict.items() if f'{name}.lora.' in k}
             module.lora.load_state_dict(lora_state)
 
@@ -48,6 +51,7 @@ def save_lora(model, path):
     for name, module in raw_model.named_modules():
         if hasattr(module, 'lora'):
             clean_name = name[7:] if name.startswith("module.") else name
+            # 按照这个规则来设置存储在state_dict中的名称(不知道为什么要设置成这样)
             lora_state = {f'{clean_name}.lora.{k}': v for k, v in module.lora.state_dict().items()}
             state_dict.update(lora_state)
     torch.save(state_dict, path)
