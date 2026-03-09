@@ -39,6 +39,7 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
 
         if (step + 1) % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)
+            # 只对lora_params部分进行clip(因为只有这一部分有梯度信息)
             torch.nn.utils.clip_grad_norm_(lora_params, args.grad_clip)
             scaler.step(optimizer)
             scaler.update()
@@ -120,6 +121,7 @@ if __name__ == "__main__":
     if args.use_compile == 1:
         model = torch.compile(model)
         Logger('torch.compile enabled')
+    # 将模型中的线性层给加上lora分支, 并修改对应的module名称
     apply_lora(model)
     
     # 统计参数
@@ -130,6 +132,7 @@ if __name__ == "__main__":
     Logger(f"LoRA 参数占比: {lora_params_count / total_params * 100:.2f}%")
     
     # 冻结非LoRA参数，收集LoRA参数
+    # 收集好的参数用于梯度反传和存储
     lora_params = []
     for name, param in model.named_parameters():
         if 'lora' in name:
