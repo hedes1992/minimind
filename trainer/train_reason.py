@@ -21,6 +21,9 @@ warnings.filterwarnings('ignore')
 
 
 def train_epoch(epoch, loader, iters, tokenizer, lm_config, start_step=0, wandb=None):
+    """
+    这里是直接对带think和answer的数据进行SFT罢了
+    """
     start_of_think_ids = tokenizer('<think>').input_ids
     end_of_think_ids = tokenizer('</think>').input_ids
     start_of_answer_ids = tokenizer('<answer>').input_ids
@@ -37,6 +40,7 @@ def train_epoch(epoch, loader, iters, tokenizer, lm_config, start_step=0, wandb=
 
         with autocast_ctx:
             res = model(input_ids)
+            # 直接算ce loss
             shift_logits = res.logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)).view(shift_labels.size())
@@ -49,6 +53,7 @@ def train_epoch(epoch, loader, iters, tokenizer, lm_config, start_step=0, wandb=
             loss_mask_flat = loss_mask.view(-1)
             loss_mask_sum = loss_mask_flat.sum()
             loss_mask_flat[sp_ids] = 10
+            # 单独把special_ids所在的位置的惩罚系数从1提高到10, 但是归一化系数loss_mask_sum不变
             loss_mask = loss_mask_flat.view(shift_labels.size())
             logits_loss = (loss * loss_mask).sum() / loss_mask_sum
             loss = logits_loss + res.aux_loss
