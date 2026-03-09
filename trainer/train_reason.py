@@ -21,6 +21,11 @@ warnings.filterwarnings('ignore')
 
 
 def train_epoch(epoch, loader, iters, tokenizer, lm_config, start_step=0, wandb=None):
+    """
+    直接基于外部得到的REASON数据进行SFT训练
+
+    REASON数据: 带有think和answer字符的对话数据
+    """
     start_of_think_ids = tokenizer('<think>').input_ids
     end_of_think_ids = tokenizer('</think>').input_ids
     start_of_answer_ids = tokenizer('<answer>').input_ids
@@ -37,6 +42,7 @@ def train_epoch(epoch, loader, iters, tokenizer, lm_config, start_step=0, wandb=
 
         with autocast_ctx:
             res = model(input_ids)
+            # 标准的ce loss
             shift_logits = res.logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)).view(shift_labels.size())
@@ -48,8 +54,10 @@ def train_epoch(epoch, loader, iters, tokenizer, lm_config, start_step=0, wandb=
                                              ).to(args.device))
             loss_mask_flat = loss_mask.view(-1)
             loss_mask_sum = loss_mask_flat.sum()
+            # think和answer等特殊字符所在位置的惩罚系数从1变为10
             loss_mask_flat[sp_ids] = 10
             loss_mask = loss_mask_flat.view(shift_labels.size())
+            # loss_mask_sum保持不变, 依旧是所有需要计算loss区域的总和
             logits_loss = (loss * loss_mask).sum() / loss_mask_sum
             loss = logits_loss + res.aux_loss
             loss = loss / args.accumulation_steps
