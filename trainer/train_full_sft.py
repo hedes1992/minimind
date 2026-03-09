@@ -21,6 +21,9 @@ warnings.filterwarnings('ignore')
 
 
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
+    """
+    iters: 每个epoch内的迭代次数
+    """
     start_time = time.time()
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
         input_ids = input_ids.to(args.device)
@@ -31,31 +34,39 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
         with autocast_ctx:
             res = model(input_ids, labels=labels)
+            # 包含正常的CE loss和辅助loss: aux_loss
             loss = res.loss + res.aux_loss
             loss = loss / args.accumulation_steps
 
+        # 外部传入的scaler是: torch.cuda.amp.GradScaler(), 在AMP下使用; 即backward之前把loss放大很多倍(比如N), 然后完成全部反传
         scaler.scale(loss).backward()
 
         if (step + 1) % args.accumulation_steps == 0:
+            # 每个地方进行参数更新前需要再把梯度降下来(1/N倍)
             scaler.unscale_(optimizer)
+            # 降下来之后才能进行clip
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
+            # 此时更新的是真实的梯度
             scaler.step(optimizer)
             scaler.update()
 
             optimizer.zero_grad(set_to_none=True)
 
         if step % args.log_interval == 0 or step == iters - 1:
+            # 到了记录周期
             spend_time = time.time() - start_time
             current_loss = loss.item() * args.accumulation_steps
             current_aux_loss = res.aux_loss.item() if res.aux_loss is not None else 0.0
             current_logits_loss = current_loss - current_aux_loss
             current_lr = optimizer.param_groups[-1]['lr']
+            # 预估训练还需要多少分钟
             eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
             Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, epoch_time: {eta_min:.1f}min')
             if wandb: wandb.log({"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min})
 
         if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
+            # 到了存储周期
             model.eval()
             moe_suffix = '_moe' if lm_config.use_moe else ''
             ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
@@ -65,6 +76,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
             lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer, 
                          epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints', scaler=scaler)
+            # 存储完再切换到训练模式
             model.train()
             del state_dict
 
@@ -100,11 +112,13 @@ if __name__ == "__main__":
     # ========== 1. 初始化环境和随机种子 ==========
     local_rank = init_distributed_mode()
     if dist.is_initialized(): args.device = f"cuda:{local_rank}"
+    # DDP训练时, 每个rank的seed设定为不一致
     setup_seed(42 + (dist.get_rank() if dist.is_initialized() else 0))
     
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(args.save_dir, exist_ok=True)
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
+    # from_resume==1 从中读取checkpoint的状态(包含优化器, 权重等信息)
     ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
     
     # ========== 3. 设置混合精度 ==========
@@ -119,9 +133,11 @@ if __name__ == "__main__":
         wandb_id = ckp_data.get('wandb_id') if ckp_data else None
         resume = 'must' if wandb_id else None
         wandb_run_name = f"MiniMind-Full-SFT-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
+        # wandb提供基础记录信息
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
     
     # ========== 5. 定义模型、数据、优化器 ==========
+    # 如果from_weight不为None, 会加载该权重
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
     if args.use_compile == 1:
         model = torch.compile(model)
@@ -134,6 +150,7 @@ if __name__ == "__main__":
     # ========== 6. 从ckp恢复状态 ==========
     start_epoch, start_step = 0, 0
     if ckp_data:
+        # 有resume时就加载resume的模型参数和优化器状态等
         model.load_state_dict(ckp_data['model'])
         optimizer.load_state_dict(ckp_data['optimizer'])
         scaler.load_state_dict(ckp_data['scaler'])
@@ -143,6 +160,7 @@ if __name__ == "__main__":
     # ========== 7. DDP包模型 ==========
     if dist.is_initialized():
         model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
+        # DDP模式下将model export到local_rank上
         model = DistributedDataParallel(model, device_ids=[local_rank])
     
     # ========== 8. 开始训练 ==========
@@ -150,10 +168,13 @@ if __name__ == "__main__":
         train_sampler and train_sampler.set_epoch(epoch)
         setup_seed(42 + epoch); indices = torch.randperm(len(train_ds)).tolist()
         skip = start_step if (epoch == start_epoch and start_step > 0) else 0
+        # 单卡时使用indices, 否则使用train_sampler(本质都是一个iterator)
         batch_sampler = SkipBatchSampler(train_sampler or indices, args.batch_size, skip)
         loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
         if skip > 0: 
+            # 此时start_step和skip是一样的
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
+            # 这里len(loader)==len(batch_sampler)==len(train_ds)-skip, 所以要加上skip, 详细参考SkipBatchSampler的定义
             train_epoch(epoch, loader, len(loader) + skip, start_step, wandb)
         else:
             train_epoch(epoch, loader, len(loader), 0, wandb)
