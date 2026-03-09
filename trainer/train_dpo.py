@@ -26,6 +26,7 @@ def logits_to_log_probs(logits, labels):
     # labels shape: (batch_size, seq_len)
     # log_probs shape: (batch_size, seq_len)
     log_probs = F.log_softmax(logits, dim=2)
+    # 代表用选取log_probs中index为labels的位置的概率出来
     log_probs_per_token = torch.gather(log_probs, dim=2, index=labels.unsqueeze(2)).squeeze(-1)
     return log_probs_per_token
 
@@ -39,14 +40,17 @@ def dpo_loss(ref_log_probs, policy_log_probs, mask, beta):
 
     # 将 chosen 和 rejected 数据分开
     batch_size = ref_log_probs.shape[0]
+    # 参考模型的chosen/reject的log_probs
     chosen_ref_log_probs = ref_log_probs[:batch_size // 2]
     reject_ref_log_probs = ref_log_probs[batch_size // 2:]
+    # actor模型的chosen/reject的log_probs
     chosen_policy_log_probs = policy_log_probs[:batch_size // 2]
     reject_policy_log_probs = policy_log_probs[batch_size // 2:]
 
     pi_logratios = chosen_policy_log_probs - reject_policy_log_probs
     ref_logratios = chosen_ref_log_probs - reject_ref_log_probs
     logits = pi_logratios - ref_logratios
+    # 其实(chosen_policy_log_probs - chosen_ref_log_probs) - (reject_policy_log_probs - reject_ref_log_probs) 也好理解
     loss = -F.logsigmoid(beta * logits)
     return loss.mean()
 
@@ -61,6 +65,7 @@ def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=
         y_rejected = batch['y_rejected'].to(args.device)
         mask_chosen = batch['mask_chosen'].to(args.device)
         mask_rejected = batch['mask_rejected'].to(args.device)
+        # 这里的x/y和dpo_loss中的batch_size//2是联动的
         x = torch.cat([x_chosen, x_rejected], dim=0)
         y = torch.cat([y_chosen, y_rejected], dim=0)
         mask = torch.cat([mask_chosen, mask_rejected], dim=0)
