@@ -32,6 +32,7 @@ def calculate_rewards(prompts, responses, reward_model, reward_tokenizer):
         matches_pattern = [re.match(pattern, response, re.S) for response in responses]
         matches_pattern2 = [re.match(pattern2, response, re.S) for response in responses]
 
+        # 同时包含think和answer的格式奖励
         format_rewards = []
         for match_pattern, match_pattern2 in zip(matches_pattern, matches_pattern2):
             if match_pattern or match_pattern2:
@@ -42,6 +43,7 @@ def calculate_rewards(prompts, responses, reward_model, reward_tokenizer):
 
         def mark_num(text):
             reward = 0
+            # 包含单个think或者answer的格式奖励
             if text.count("<think>") == 1: reward += 0.25
             if text.count("</think>") == 1: reward += 0.25
             if text.count("<answer>") == 1: reward += 0.25
@@ -54,6 +56,7 @@ def calculate_rewards(prompts, responses, reward_model, reward_tokenizer):
 
     rewards = torch.zeros(len(responses), device=args.device)
     if args.reasoning == 1:
+        # 如果本身是推理模型，要求模型输出必须有推理格式，然后算格式奖励
         rewards = reasoning_model_reward(rewards)
 
     with torch.no_grad():
@@ -64,23 +67,29 @@ def calculate_rewards(prompts, responses, reward_model, reward_tokenizer):
         for i in range(batch_size):
             for j in range(args.num_generations):
                 response_idx = i * args.num_generations + j
+                # 获取到针对第i个prompt的第j个rollout输出
                 response = responses[response_idx]
                 prompt = prompts[i]
 
                 pattern = r"<\|im_start\|>(system|user|assistant)\s+(.*?)<\|im_end\|>"
                 matches = re.findall(pattern, prompt, re.DOTALL)
+                # 把chat_template格式的字符转换为role/content形式
                 messages = [{"role": role, "content": content.strip()} for role, content in matches]
 
                 tmp_chat = messages + [{"role": "assistant", "content": response}]
+                # 完整的问答记录给到RewardModel来进行判分
                 score = reward_model.get_score(reward_tokenizer, tmp_chat)
+                # 判分必须在范围内
                 score = max(min(score, scale), -scale)
 
                 if args.reasoning == 1:
                     answer_match = re.search(r'<answer>(.*?)</answer>', response, re.DOTALL)
                     if answer_match:
                         answer_content = answer_match.group(1).strip()
+                        # 对推理模型只提取其中的answer部分加到问答记录中
                         tmp_chat = messages + [{"role": "assistant", "content": answer_content}]
                         answer_score = reward_model.get_score(reward_tokenizer, tmp_chat)
+                        # 单纯对推理模型的answer而非think部分进行打分
                         answer_score = max(min(answer_score, scale), -scale)
                         score = score * 0.4 + answer_score * 0.6
 
@@ -104,6 +113,7 @@ def grpo_train_epoch(epoch, loader, iters, ref_model, reward_model, reward_token
         with torch.no_grad():
             # DDP 模型需要使用 .module 访问 generate 方法
             model_for_gen = model.module if isinstance(model, DistributedDataParallel) else model
+            # 为每个prompts都生成num_generations个rollout
             outputs = model_for_gen.generate(
                 **prompt_inputs, max_new_tokens=args.max_gen_len, do_sample=True, temperature=0.8,
                 num_return_sequences=args.num_generations, pad_token_id=tokenizer.pad_token_id)  # [B*num_gen, P+R]
@@ -258,6 +268,7 @@ if __name__ == "__main__":
     # Reference模型
     ref_model, _ = init_model(lm_config, base_weight, device=args.device)
     ref_model = ref_model.eval().requires_grad_(False)
+    # 需要一个第三方的Reward Model来算reward值
     # Reward模型
     reward_model = AutoModel.from_pretrained(
         args.reward_model_path, torch_dtype=torch.float16, trust_remote_code=True
@@ -271,6 +282,7 @@ if __name__ == "__main__":
     loader_for_count = DataLoader(train_ds, batch_size=args.batch_size, sampler=train_sampler)
     iters = len(loader_for_count)
     total_optimizer_steps = (iters // args.accumulation_steps) * args.epochs
+    # 这里单独计算整体步数来初始化一个学习率的scheduler
     scheduler = CosineAnnealingLR(optimizer, T_max=total_optimizer_steps, eta_min=args.learning_rate / 10)
     
     # ========== 6. 从ckp恢复状态 ==========
